@@ -17,6 +17,10 @@ Efficiency: batch size proportional to demand
 #include <unistd.h> // usleep
 #include <time.h>
 
+// ADD THESE PROTOTYPES HERE
+static long long now_usec(void);
+static int now_tick(ThreadManager *manager);
+
 // The manager shared by all threads @Qingzheng
 struct ThreadManager
 
