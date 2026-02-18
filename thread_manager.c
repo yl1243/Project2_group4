@@ -17,27 +17,6 @@ Efficiency: batch size proportional to demand
 #include <unistd.h> // usleep
 #include <time.h>
 
-// ============
-// Return current time in microseconds (monotonic clock)
-// 返回当前时间（微秒），单调时钟不会倒退
-static long long now_usec()
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
-}
-
-// Convert wall time to "tick" where 1 tick = unit_usec
-// 把真实时间换算成 tick：1 tick = unit_usec 微秒
-static int now_tick(ThreadManager *manager)
-{
-    long long elapsed = now_usec() - manager->start_time;
-    if (manager->config->unit_usec <= 0)
-        return 0;
-    return (int)(elapsed / (long long)manager->config->unit_usec);
-}
-// ======================
-
 // The manager shared by all threads @Qingzheng
 struct ThreadManager
 
@@ -310,6 +289,28 @@ Customer **sort_customers_by_arrival_time(Customer *customers, int total_custome
     qsort(sorted_customers, total_customers, sizeof(Customer *), sort_customers_by_arrival_time_comparator);
     return sorted_customers;
 }
+
+// ============ @Yujie
+// Helper func
+// Return current time in microseconds (monotonic clock)
+// 返回当前时间（微秒），单调时钟不会倒退
+static long long now_usec()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+// Convert wall time to "tick" where 1 tick = unit_usec
+// 把真实时间换算成 tick：1 tick = unit_usec 微秒
+static int now_tick(ThreadManager *manager)
+{
+    long long elapsed = now_usec() - manager->start_time;
+    if (manager->config->unit_usec <= 0)
+        return 0;
+    return (int)(elapsed / (long long)manager->config->unit_usec);
+}
+// ================================
 
 // @Yujie =======================
 // Thread argument wrapper
