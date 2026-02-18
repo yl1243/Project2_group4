@@ -21,7 +21,7 @@ Efficiency: batch size proportional to demand
 struct ThreadManager
 
 {
-    StairConfig *config;
+    const StairConfig *config;
 
     // @Yujie =====================
     // step semaphores — every step has one
