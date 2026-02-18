@@ -416,7 +416,8 @@ static void *customer_thread(void *arg)
           customer->name,
           customer->direction == DIRECTION_UP ? "UP" : "DOWN");
 
-    // 2. Enter the waiting queue (Margin area)
+    // 2. Enter waiting + wait until allowed (all under ONE mutex lock)
+    // 在同一个 mutex 内：登记等待 + 等待放行 + 真正进
     pthread_mutex_lock(&manager->mutex);
 
     if (customer->direction == DIRECTION_UP)
@@ -436,16 +437,6 @@ static void *customer_thread(void *arg)
 
     // // 4. Can enter the stair
     // manager->current_direction = customer->direction;
-
-    // Enter waiting + wait until allowed (all under ONE mutex lock)
-    // 在同一个 mutex 内：登记等待 + 等待放行 + 真正进
-    pthread_mutex_lock(&manager->mutex);
-
-    // 先登记等待人数（你原本有，保留）
-    if (customer->direction == DIRECTION_UP)
-        manager->waiting_up_count++;
-    else
-        manager->waiting_down_count++;
 
     // 核心：循环等待直到“能进入”
     // 条件 = (楼梯空时先启动新batch) + (方向匹配) + (本批还有名额)
@@ -480,7 +471,7 @@ static void *customer_thread(void *arg)
 
     pthread_mutex_unlock(&manager->mutex);
 
-        // Climb stairs（ semaphore control each stair）
+    // Climb stairs（ semaphore control each stair）
     int S = manager->config->total_stair_steps;
 
     for (int i = 0; i < S; i++)
