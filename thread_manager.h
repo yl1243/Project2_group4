@@ -17,8 +17,9 @@ typedef struct
     int max_batch_size;          // Max number of customers allowed in one batch
     int max_consecutive_batches; // Max number of consecutive batches in the same direction to prevent starvation
 
-    // @Yujie
+    // =======================@Yujie
     int unit_usec; // time per step in microseconds， total time appx = S * unit_sec
+    // ==========================
 
 } StairConfig;
 

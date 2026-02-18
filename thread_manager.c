@@ -17,6 +17,27 @@ Efficiency: batch size proportional to demand
 #include <unistd.h> // usleep
 #include <time.h>
 
+// ============
+// Return current time in microseconds (monotonic clock)
+// 返回当前时间（微秒），单调时钟不会倒退
+static long long now_usec()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+// Convert wall time to "tick" where 1 tick = unit_usec
+// 把真实时间换算成 tick：1 tick = unit_usec 微秒
+static int now_tick(ThreadManager *manager)
+{
+    long long elapsed = now_usec() - manager->start_time;
+    if (manager->config->unit_usec <= 0)
+        return 0;
+    return (int)(elapsed / (long long)manager->config->unit_usec);
+}
+// ======================
+
 // The manager shared by all threads @Qingzheng
 struct ThreadManager
 
@@ -91,6 +112,9 @@ ThreadManager *thread_manager_create(const StairConfig *config)
     manager->on_stairs_count = 0;
     manager->waiting_up_count = 0;
     manager->waiting_down_count = 0;
+    manager->current_patch_not_on_stairs_yet_count = 0; // batch remaining
+    manager->current_direction_batch_count = 0;         // consecutive batches
+    // 否则默认是随机垃圾值，后面逻辑会乱
 
     // start clock
     struct timespec ts;
@@ -148,7 +172,7 @@ void simulate(ThreadManager *manager, Queue *incoming_customers, int tick)
     while (!queue_is_empty(incoming_customers) && queue_front(incoming_customers)->arrival_time <= tick)
     {
         Customer *customer = queue_dequeue(incoming_customers);
-        print(manager, "Tick %d: Customer %s arrives waiting to go %s\n", tick, customer->name,
+        print(manager, "Tick %d: Customer %s arrives waiting to go %s\n", now_tick(manager), customer->name,
               customer->direction == DIRECTION_UP ? "UP" : "DOWN");
 
         if (customer->direction == DIRECTION_UP)
@@ -295,6 +319,77 @@ typedef struct
     Customer *customer;
 } CustomerThreadArg;
 
+// Decide next direction when stairs are empty
+// 楼梯空时决定下一批方向（防饥饿：连续批次到上限就换向）
+static Direction choose_next_direction(ThreadManager *manager)
+{
+    // nobody waiting
+    if (manager->waiting_up_count == 0 && manager->waiting_down_count == 0)
+    {
+        return DIRECTION_NONE;
+    }
+    // only one side waiting
+    if (manager->waiting_up_count == 0)
+        return DIRECTION_DOWN;
+    if (manager->waiting_down_count == 0)
+        return DIRECTION_UP;
+
+    // starvation prevention: too many consecutive batches in same direction -> force switch
+    if (manager->current_direction != DIRECTION_NONE &&
+        manager->current_direction_batch_count >= manager->config->max_consecutive_batches)
+    {
+        return (manager->current_direction == DIRECTION_UP) ? DIRECTION_DOWN : DIRECTION_UP;
+    }
+
+    // otherwise, pick something (random / or larger waiting side)
+    // 否则可以随机，或选等待人数更多的一侧（更“efficient”）
+    if (manager->waiting_up_count > manager->waiting_down_count)
+        return DIRECTION_UP;
+    if (manager->waiting_down_count > manager->waiting_up_count)
+        return DIRECTION_DOWN;
+
+    return (rand() % 2 == 0) ? DIRECTION_UP : DIRECTION_DOWN;
+}
+
+// 启动新 batch（设置方向 + batch size + batch count）
+static void start_new_batch_if_needed(ThreadManager *manager)
+{
+    // only do this when stairs are empty
+    if (manager->on_stairs_count != 0)
+        return;
+
+    // if current batch still has remaining slots, keep it
+    if (manager->current_patch_not_on_stairs_yet_count > 0 &&
+        manager->current_direction != DIRECTION_NONE)
+        return;
+
+    Direction next = choose_next_direction(manager);
+
+    if (next == DIRECTION_NONE)
+    {
+        manager->current_direction = DIRECTION_NONE;
+        manager->current_patch_not_on_stairs_yet_count = 0;
+        return;
+    }
+
+    // reset consecutive count if direction changes
+    if (manager->current_direction != next)
+    {
+        manager->current_direction_batch_count = 0;
+    }
+
+    manager->current_direction = next;
+
+    int waiting = (next == DIRECTION_UP) ? manager->waiting_up_count : manager->waiting_down_count;
+    int batch_size = waiting;
+    if (batch_size > manager->config->max_batch_size)
+        batch_size = manager->config->max_batch_size;
+
+    manager->current_patch_not_on_stairs_yet_count = batch_size;
+    if (batch_size > 0)
+        manager->current_direction_batch_count += 1;
+}
+
 // Customer thread function
 // One customer: one thread
 static void *customer_thread(void *arg)
@@ -303,8 +398,9 @@ static void *customer_thread(void *arg)
     ThreadManager *manager = a->manager;
     Customer *customer = a->customer;
 
-    // 1. Stimulate arrival time
-    usleep(customer->arrival_time * 1000); // Time Unit: ms
+    // 1. Simulate arrival time (tick → real time)
+    // arrival_time 是 tick 单位，需要乘 unit_usec 才是实际时间
+    usleep((useconds_t)((long long)customer->arrival_time * manager->config->unit_usec));
 
     print(manager,
           "Tick %d: Customer %s arrives waiting to go %s\n",
@@ -321,17 +417,54 @@ static void *customer_thread(void *arg)
         manager->waiting_down_count++;
 
     // 3. Wait until being allowed to enter the stairs
-    while (
-        manager->current_direction != DIRECTION_NONE &&
-        manager->current_direction != customer->direction)
+    // while (
+    //     manager->current_direction != DIRECTION_NONE &&
+    //     manager->current_direction != customer->direction)
+    // {
+    //     pthread_cond_wait(
+    //         &manager->stairs_state_changed,
+    //         &manager->mutex);
+    // }
+
+    // // 4. Can enter the stair
+    // manager->current_direction = customer->direction;
+
+    // 完全在 mutex 保护内
+    pthread_mutex_lock(&manager->mutex);
+
+    // 先登记等待人数（你原本有，保留）
+    if (customer->direction == DIRECTION_UP)
+        manager->waiting_up_count++;
+    else
+        manager->waiting_down_count++;
+
+    // 核心：循环等待直到“能进入”
+    // 条件 = (楼梯空时先启动新batch) + (方向匹配) + (本批还有名额)
+    while (1)
     {
-        pthread_cond_wait(
-            &manager->stairs_state_changed,
-            &manager->mutex);
+        // 如果楼梯空，可能需要启动新批次（决定方向+batch size）
+        start_new_batch_if_needed(manager);
+
+        int direction_ok = (manager->current_direction == customer->direction);
+        int batch_ok = (manager->current_patch_not_on_stairs_yet_count > 0);
+
+        // 能进入：方向一致 + batch还有名额
+        if (direction_ok && batch_ok)
+            break;
+
+        pthread_cond_wait(&manager->stairs_state_changed, &manager->mutex);
     }
 
-    // 4. Can enter the stair
-    manager->current_direction = customer->direction;
+    // 允许进入：更新共享状态
+    if (customer->direction == DIRECTION_UP)
+        manager->waiting_up_count--;
+    else
+        manager->waiting_down_count--;
+
+    manager->on_stairs_count++;
+    manager->current_patch_not_on_stairs_yet_count--; // 本批名额减少
+
+    pthread_mutex_unlock(&manager->mutex);
 
     if (customer->direction == DIRECTION_UP)
         manager->waiting_up_count--;
@@ -352,19 +485,38 @@ static void *customer_thread(void *arg)
 
     for (int i = 0; i < S; i++)
     {
-        // Occupy next stair
         sem_wait(&manager->step_semaphores[i]);
 
-        // Release previous stair
+        // 记录每个人走到哪一阶
+        customer->current_step = i + 1;
+
+        // ✅ 第一次踏上楼梯：记录 response_time
+        // record response time at first step on stairs
+        if (i == 0 && customer->response_time == -1)
+        {
+            int t = now_tick(manager);
+            customer->response_time = t - customer->arrival_time;
+        }
+
         if (i > 0)
             sem_post(&manager->step_semaphores[i - 1]);
-        usleep(100000); // Every stair consumed time
+
+        // ✅ 用配置的 unit_usec（别写死 100000）,你现在写死 usleep(100000) 会导致你输入的 unit_usec 参数完全没用。
+        usleep(manager->config->unit_usec);
     }
 
     // release last stair
     if (S > 0)
     {
         sem_post(&manager->step_semaphores[S - 1]);
+    }
+
+    // ✅ 走完楼梯：记录 turnaround_time
+    // record turnaround time when finished
+    if (customer->turnaround_time == -1)
+    {
+        int t = now_tick(manager);
+        customer->turnaround_time = t - customer->arrival_time;
     }
 
     // leave the stairs
@@ -381,6 +533,10 @@ static void *customer_thread(void *arg)
 
     if (manager->on_stairs_count == 0)
     {
+        // batch用完 or 让系统重新选下一批
+        // 楼梯空了就让下一次进入者触发新 batch
+        // 这样下一波等待线程醒来时，start_new_batch_if_needed() 会根据等待人数 + consecutive 限制来选方向，保证不会饥饿。
+        manager->current_patch_not_on_stairs_yet_count = 0;
         manager->current_direction = DIRECTION_NONE;
     }
 
