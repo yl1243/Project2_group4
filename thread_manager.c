@@ -14,34 +14,15 @@ Efficiency: batch size proportional to demand
 #include <stdlib.h>
 #include <stdarg.h>
 #include <semaphore.h>
-#include <unistd.h> // usleep
+#include <unistd.h>
 #include <time.h>
 
-// ADD THESE PROTOTYPES HERE
+// ADD PROTOTYPES
 static long long now_usec(void);
 static int now_tick(ThreadManager *manager);
-
-// ============ @Yujie
-// Helper func
-// Return current time in microseconds (monotonic clock)
-// 返回当前时间（微秒），单调时钟不会倒退
-static long long now_usec()
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
-}
-
-// Convert wall time to "tick" where 1 tick = unit_usec
-// 把真实时间换算成 tick：1 tick = unit_usec 微秒
-static int now_tick(ThreadManager *manager)
-{
-    long long elapsed = now_usec() - manager->start_time;
-    if (manager->config->unit_usec <= 0)
-        return 0;
-    return (int)(elapsed / (long long)manager->config->unit_usec);
-}
-// ================================
+static Direction choose_next_direction(ThreadManager *manager);
+static void start_new_batch_if_needed(ThreadManager *manager);
+static void *customer_thread(void *arg);
 
 // The manager shared by all threads @Qingzheng
 struct ThreadManager
@@ -84,6 +65,28 @@ struct ThreadManager
     // Track: how many consecutive same direction batches (to prevent starvation)
     int current_direction_batch_count;
 };
+
+// ============ @Yujie
+// Helper func
+// Return current time in microseconds (monotonic clock)
+// 返回当前时间（微秒），单调时钟不会倒退
+static long long now_usec()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+// Convert wall time to "tick" where 1 tick = unit_usec
+// 把真实时间换算成 tick：1 tick = unit_usec 微秒
+static int now_tick(ThreadManager *manager)
+{
+    long long elapsed = now_usec() - manager->start_time;
+    if (manager->config->unit_usec <= 0)
+        return 0;
+    return (int)(elapsed / (long long)manager->config->unit_usec);
+}
+// ================================
 
 // [Exposed]
 // Create a thread manager @Qingzheng
@@ -434,7 +437,8 @@ static void *customer_thread(void *arg)
     // // 4. Can enter the stair
     // manager->current_direction = customer->direction;
 
-    // 完全在 mutex 保护内
+    // Enter waiting + wait until allowed (all under ONE mutex lock)
+    // 在同一个 mutex 内：登记等待 + 等待放行 + 真正进
     pthread_mutex_lock(&manager->mutex);
 
     // 先登记等待人数（你原本有，保留）
@@ -460,7 +464,7 @@ static void *customer_thread(void *arg)
         pthread_cond_wait(&manager->stairs_state_changed, &manager->mutex);
     }
 
-    // 允许进入：更新共享状态
+    // now enter: update shared state 允许进入：更新共享状态
     if (customer->direction == DIRECTION_UP)
         manager->waiting_up_count--;
     else
@@ -469,15 +473,6 @@ static void *customer_thread(void *arg)
     manager->on_stairs_count++;
     manager->current_patch_not_on_stairs_yet_count--; // 本批名额减少
 
-    pthread_mutex_unlock(&manager->mutex);
-
-    if (customer->direction == DIRECTION_UP)
-        manager->waiting_up_count--;
-    else
-        manager->waiting_down_count--;
-
-    manager->on_stairs_count++;
-
     print(manager,
           "Customer %s STARTS going %s\n",
           customer->name,
@@ -485,7 +480,7 @@ static void *customer_thread(void *arg)
 
     pthread_mutex_unlock(&manager->mutex);
 
-    // Climb stairs（ semaphore control each stair）
+        // Climb stairs（ semaphore control each stair）
     int S = manager->config->total_stair_steps;
 
     for (int i = 0; i < S; i++)
